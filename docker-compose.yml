@@ -1,0 +1,32 @@
+version: "3.9"
+services:
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    ports: ["27017:27017"]
+    volumes: ["mongo_data:/data/db"]
+
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    env_file: ./backend/.env
+    environment:
+      - MONGO_URI=mongodb://mongo:27017/tpms
+      - CLIENT_ORIGIN=http://localhost:3000
+    ports: ["5000:5000"]
+    depends_on: [mongo]
+    volumes:
+      - uploads_data:/app/src/uploads
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_URL: http://localhost:5000/api
+    restart: unless-stopped
+    ports: ["3000:80"]
+    depends_on: [backend]
+
+volumes:
+  mongo_data:
+  uploads_data:

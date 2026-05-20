@@ -1,0 +1,29 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: backend } }
+  template:
+    metadata: { labels: { app: backend } }
+    spec:
+      containers:
+        - name: backend
+          image: DOCKERHUB_USERNAME/tpms-backend:latest
+          ports: [{ containerPort: 5000 }]
+          env:
+            - name: PORT
+              value: "5000"
+            - name: NODE_ENV
+              value: "production"
+            - name: MONGO_URI
+              valueFrom: { secretKeyRef: { name: tpms-secrets, key: MONGO_URI } }
+            - name: JWT_SECRET
+              valueFrom: { secretKeyRef: { name: tpms-secrets, key: JWT_SECRET } }
+          volumeMounts:
+            - name: uploads
+              mountPath: /app/src/uploads
+      volumes:
+        - name: uploads
+          persistentVolumeClaim: { claimName: uploads-pvc }
