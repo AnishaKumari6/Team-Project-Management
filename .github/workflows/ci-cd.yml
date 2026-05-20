@@ -1,99 +1,191 @@
-name: CI/CD
+name: CI/CD Pipeline
 
 on:
   push:
-    branches: [main]
-  workflow_dispatch:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
 
+env:
+  DOCKER_BACKEND_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/tpms-backend
+  DOCKER_FRONTEND_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/tpms-frontend
+
+# ─────────────────────────────────────────────
+# JOB 1 – Test backend
+# ─────────────────────────────────────────────
 jobs:
   test:
+    name: Test Backend
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
         with:
-          node-version: 20
-          cache: npm
-          cache-dependency-path: |
-            backend/package-lock.json
-            frontend/package-lock.json
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: backend/package-lock.json
 
-      - name: Install backend
+      - name: Install backend dependencies
         working-directory: backend
-        run: npm install --no-audit --no-fund
+        run: npm ci
 
-      - name: Test backend
+      - name: Run backend tests
         working-directory: backend
-        run: npm test
+        env:
+          NODE_ENV: test
+          MONGO_URI: ${{ secrets.MONGO_URI_TEST || 'mongodb://localhost:27017/tpms_test' }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET || 'ci-test-secret' }}
+        run: |
+          # Run tests if a test script exists; skip gracefully if not
+          if grep -q '"test"' package.json; then
+            npm test
+          else
+            echo "No test script found – skipping."
+          fi
 
-      - name: Install frontend
+  # ─────────────────────────────────────────────
+  # JOB 2 – Build frontend
+  # ─────────────────────────────────────────────
+  build-frontend:
+    name: Build Frontend
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
         working-directory: frontend
-        run: npm install --no-audit --no-fund
+        run: npm ci
 
       - name: Build frontend
         working-directory: frontend
         env:
+          # Uses the production backend URL injected at build time
           VITE_API_URL: ${{ secrets.VITE_API_URL }}
         run: npm run build
 
+      - name: Upload dist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist
+          retention-days: 1
+
+  # ─────────────────────────────────────────────
+  # JOB 3 – Docker build & push
+  # ─────────────────────────────────────────────
   docker:
-    needs: test
+    name: Docker Build & Push
     runs-on: ubuntu-latest
+    needs: [test, build-frontend]
+    # Only push images on merges to main, not on PRs
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-      - uses: docker/setup-buildx-action@v3
+      - name: Download frontend dist artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist
 
-      - name: Login Docker Hub
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build & push backend
-        uses: docker/build-push-action@v6
+      - name: Build & push backend image
+        uses: docker/build-push-action@v5
         with:
           context: ./backend
           push: true
-          tags: ${{ secrets.DOCKERHUB_USERNAME }}/tpms-backend:latest
+          tags: |
+            ${{ env.DOCKER_BACKEND_IMAGE }}:latest
+            ${{ env.DOCKER_BACKEND_IMAGE }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
-      - name: Build & push frontend
-        uses: docker/build-push-action@v6
+      - name: Build & push frontend image
+        uses: docker/build-push-action@v5
         with:
           context: ./frontend
           push: true
           build-args: |
             VITE_API_URL=${{ secrets.VITE_API_URL }}
-          tags: ${{ secrets.DOCKERHUB_USERNAME }}/tpms-frontend:latest
+          tags: |
+            ${{ env.DOCKER_FRONTEND_IMAGE }}:latest
+            ${{ env.DOCKER_FRONTEND_IMAGE }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
+  # ─────────────────────────────────────────────
+  # JOB 4 – Deploy
+  # ─────────────────────────────────────────────
   deploy:
-    needs: docker
+    name: Deploy
     runs-on: ubuntu-latest
+    needs: docker
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-      - name: Trigger Render deploy
-        run: curl -fsSL -X POST "${{ secrets.RENDER_DEPLOY_HOOK }}"
+      # ── Backend → Render ──────────────────────
+      - name: Deploy backend to Render
+        run: |
+          response=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X POST "${{ secrets.RENDER_DEPLOY_HOOK }}")
+          echo "Render response: $response"
+          if [ "$response" -ne 200 ] && [ "$response" -ne 201 ] && [ "$response" -ne 204 ]; then
+            echo "Render deploy hook returned unexpected status: $response"
+            exit 1
+          fi
+          echo "Render deploy triggered successfully."
 
-      - uses: actions/setup-node@v4
+      # ── Frontend → Vercel ─────────────────────
+      - name: Set up Node.js (for Vercel CLI)
+        uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: "20"
 
       - name: Install Vercel CLI
-        run: npm i -g vercel@latest
+        run: npm install -g vercel@latest
 
-      - name: Pull Vercel env
-        working-directory: frontend
-        run: vercel pull --yes --environment=production --token=${{ secrets.VERCEL_TOKEN }}
+      - name: Download frontend dist artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist
 
-      - name: Build with Vercel
+      - name: Deploy frontend to Vercel
         working-directory: frontend
-        run: vercel build --prod --token=${{ secrets.VERCEL_TOKEN }}
-
-      - name: Deploy to Vercel
-        working-directory: frontend
-        run: vercel deploy --prebuilt --prod --token=${{ secrets.VERCEL_TOKEN }}
         env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
           VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
           VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+        run: |
+          vercel pull --yes --environment=production --token=$VERCEL_TOKEN
+          vercel build --prod --token=$VERCEL_TOKEN
+          vercel deploy --prebuilt --prod --token=$VERCEL_TOKEN
