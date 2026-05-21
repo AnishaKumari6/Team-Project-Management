@@ -19,12 +19,23 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 // Prometheus metrics
 const register = new client.Registry();
 client.collectDefaultMetrics({ register });
+client.register.setDefaultLabels({
+  app: "tpms-backend"
+});
+
+app.get("/", (req, res) => {
+  res.json({
+    status: "running",
+    message: "TPMS backend is live"
+  });
+});
 app.get('/metrics', async (_req, res) => {
   res.set('Content-Type', register.contentType);
   res.end(await register.metrics());
 });
 
 app.get('/health', (_req, res) => res.json({ status: 'ok' }));
+
 
 app.use('/api/auth', require('./routes/authRoutes'));
 app.use('/api/projects', require('./routes/projectRoutes'));
